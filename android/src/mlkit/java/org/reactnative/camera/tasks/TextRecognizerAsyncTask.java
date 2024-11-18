@@ -1,59 +1,72 @@
 package org.reactnative.camera.tasks;
 
+import android.app.Activity;
 import android.graphics.Rect;
 import android.util.Log;
 
 import com.facebook.react.bridge.Arguments;
+import com.facebook.react.bridge.Promise;
 import com.facebook.react.bridge.ReadableArray;
 import com.facebook.react.bridge.ReadableMap;
 import com.facebook.react.bridge.WritableArray;
 import com.facebook.react.bridge.WritableMap;
 import com.facebook.react.uimanager.ThemedReactContext;
-
 import com.google.android.cameraview.CameraView;
-import com.google.android.gms.tasks.OnFailureListener;
-import com.google.android.gms.tasks.OnSuccessListener;
+import com.google.android.gms.tasks.Task;
 import com.google.mlkit.vision.common.InputImage;
 import com.google.mlkit.vision.text.Text;
-import com.google.mlkit.vision.text.TextRecognizer;
+import com.google.mlkit.vision.text.Text.Line;
+import com.google.mlkit.vision.text.Text.TextBlock;
+import com.google.mlkit.vision.text.Text.Element;
 import com.google.mlkit.vision.text.TextRecognition;
+import com.google.mlkit.vision.text.TextRecognizer;
 import com.google.mlkit.vision.text.TextRecognizerOptions;
 
 import org.reactnative.camera.utils.ImageDimensions;
+import org.reactnative.facedetector.FaceDetectorUtils;
+import org.reactnative.frame.RNFrame;
+import org.reactnative.frame.RNFrameFactory;
 
+import java.lang.ref.WeakReference;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 
-public class TextRecognizerAsyncTask extends android.os.AsyncTask<Void, Void, Void> {
+public class TextRecognizerAsyncTask {
+  private static final String TAG = "TextRecognizerTask";
 
-  private TextRecognizerAsyncTaskDelegate mDelegate;
-  private ThemedReactContext mThemedReactContext;
-  private byte[] mImageData;
-  private int mWidth;
-  private int mHeight;
-  private int mRotation;
-  private double mScaleX;
-  private double mScaleY;
-  private ImageDimensions mImageDimensions;
-  private int mPaddingLeft;
-  private int mPaddingTop;
-  private String TAG = "RNCamera";
+  private final TextRecognizerAsyncTaskDelegate mDelegate;
+  private final WeakReference<ThemedReactContext> mThemedReactContextRef;
+  private final WeakReference<Activity> mActivityRef;
+  private TextRecognizer mTextRecognizer;
+  private final byte[] mImageData;
+  private final int mWidth;
+  private final int mHeight;
+  private final int mRotation;
+  private final ImageDimensions mImageDimensions;
+  private final double mScaleX;
+  private final double mScaleY;
+  private final int mPaddingLeft;
+  private final int mPaddingTop;
+  private final AtomicBoolean isCancelled = new AtomicBoolean(false);
 
   public TextRecognizerAsyncTask(
-      TextRecognizerAsyncTaskDelegate delegate,
-      ThemedReactContext themedReactContext,
-      byte[] imageData,
-      int width,
-      int height,
-      int rotation,
-      float density,
-      int facing,
-      int viewWidth,
-      int viewHeight,
-      int viewPaddingLeft,
-      int viewPaddingTop
+          TextRecognizerAsyncTaskDelegate delegate,
+          ThemedReactContext themedReactContext,
+          byte[] imageData,
+          int width,
+          int height,
+          int rotation,
+          float density,
+          int facing,
+          int viewWidth,
+          int viewHeight,
+          int viewPaddingLeft,
+          int viewPaddingTop
   ) {
     mDelegate = delegate;
+    mThemedReactContextRef = new WeakReference<>(themedReactContext);
+    mActivityRef = new WeakReference<>(themedReactContext.getCurrentActivity());
     mImageData = imageData;
     mWidth = width;
     mHeight = height;
@@ -65,149 +78,143 @@ public class TextRecognizerAsyncTask extends android.os.AsyncTask<Void, Void, Vo
     mPaddingTop = viewPaddingTop;
   }
 
-  @Override
-  protected Void doInBackground(Void... ignored) {
-    if (isCancelled() || mDelegate == null) {
-      return null;
-    }
+  public void execute() {
+    new Thread(() -> {
+      if (isCancelled.get()) return;
 
-    TextRecognizer detector = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS);
-
-    InputImage image = InputImage.fromByteArray(mImageData, mWidth, mHeight, getFirebaseRotation(), InputImage.IMAGE_FORMAT_YV12);
-    detector.process(image)
-            .addOnSuccessListener(new OnSuccessListener<Text>() {
-              @Override
-              public void onSuccess(Text firebaseVisionText) {
-                List<Text.TextBlock> textBlocks = firebaseVisionText.getTextBlocks();
-                WritableArray serializedData = serializeEventData(textBlocks);
-                mDelegate.onTextRecognized(serializedData);
-                mDelegate.onTextRecognizerTaskCompleted();
-                }
-            })
-            .addOnFailureListener(
-                    new OnFailureListener() {
-                      @Override
-                      public void onFailure(Exception e) {
-                        Log.e(TAG, "Text recognition task failed" + e);
-                        mDelegate.onTextRecognizerTaskCompleted();
-                        }
-                    });
-
-    return null;
-  }
-
-  private int getFirebaseRotation(){
-    int result;
-    switch (mRotation) {
-      case 0:
-        result = 0;
-        break;
-      case 90:
-        result = 90;
-        break;
-      case 180:
-        result = 180;
-        break;
-      case -90:
-      case 270:
-        result = 270;
-        break;
-      default:
-        result = 0;
-        Log.e(TAG, "Bad rotation value: " + mRotation);
-    }
-    return result;
-  }
-
-  private WritableArray serializeEventData(List<Text.TextBlock> textBlocks) {
-    WritableArray textBlocksList = Arguments.createArray();
-    for (Text.TextBlock block: textBlocks) {
-      WritableMap serializedTextBlock = serializeBloc(block);
-      if (mImageDimensions.getFacing() == CameraView.FACING_FRONT) {
-        serializedTextBlock = rotateTextX(serializedTextBlock);
+      List<TextBlock> textBlocks = null;
+      if (mDelegate != null) {
+        try {
+          mTextRecognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS);
+          RNFrame frame = RNFrameFactory.buildFrame(mImageData, mWidth, mHeight, mRotation);
+          InputImage image = frame.getFrame();
+          Task<Text> task = mTextRecognizer.process(image);
+          textBlocks = task.getResult().getTextBlocks();
+        } catch (Exception e) {
+          Log.e(TAG, "Error processing image: ", e);
+        }
       }
-      textBlocksList.pushMap(serializedTextBlock);
-    }
 
-    return textBlocksList;
+      final List<TextBlock> finalTextBlocks = textBlocks;
+
+      // Check if activity and context are still valid
+      ThemedReactContext context = mThemedReactContextRef.get();
+      Activity activity = mActivityRef.get();
+
+      if (context != null && activity != null && !activity.isFinishing() && !activity.isDestroyed() && !isCancelled.get()) {
+        activity.runOnUiThread(() -> {
+          try {
+            if (mTextRecognizer != null) {
+              mTextRecognizer.close();
+            }
+
+            if (finalTextBlocks != null && !isCancelled.get()) {
+              WritableArray textBlocksList = Arguments.createArray();
+              for (TextBlock textBlock : finalTextBlocks) {
+                WritableMap serializedTextBlock = serializeText(textBlock);
+                if (mImageDimensions.getFacing() == CameraView.FACING_FRONT) {
+                  serializedTextBlock = rotateTextX(serializedTextBlock);
+                }
+                textBlocksList.pushMap(serializedTextBlock);
+              }
+              mDelegate.onTextRecognized(textBlocksList);
+            }
+            mDelegate.onTextRecognizerTaskCompleted();
+          } catch (Exception e) {
+            Log.e(TAG, "Error in UI thread: ", e);
+          }
+        });
+      } else {
+        // Cleanup if context or activity is no longer valid
+        if (mTextRecognizer != null) {
+          mTextRecognizer.close();
+        }
+      }
+    }).start();
   }
 
-  private WritableMap serializeBloc(Text.TextBlock block) {
-    WritableMap encodedText = Arguments.createMap();
-    WritableArray lines = Arguments.createArray();
-    for (Text.Line line : block.getLines()) {
-      lines.pushMap(serializeLine(line));
+  public void cancel() {
+    isCancelled.set(true);
+    if (mTextRecognizer != null) {
+      mTextRecognizer.close();
     }
-    encodedText.putArray("components", lines);
+  }
 
-    encodedText.putString("value", block.getText());
+  private WritableMap serializeText(TextBlock text) {
+    WritableMap encodedText = Arguments.createMap();
 
-    WritableMap bounds = processBounds(block.getBoundingBox());
+    WritableArray components = Arguments.createArray();
+    for (Line component : text.getLines()) {
+      components.pushMap(serializeText(component));
+    }
+    encodedText.putArray("components", components);
 
-    encodedText.putMap("bounds", bounds);
-
+    encodedText.putString("value", text.getText());
+    encodedText.putMap("bounds", serializeBounds(text.getBoundingBox()));
     encodedText.putString("type", "block");
+
     return encodedText;
   }
 
-  private WritableMap serializeLine(Text.Line line) {
+  private WritableMap serializeText(Line text) {
     WritableMap encodedText = Arguments.createMap();
-    WritableArray lines = Arguments.createArray();
-    for (Text.Element element : line.getElements()) {
-      lines.pushMap(serializeElement(element));
+
+    WritableArray components = Arguments.createArray();
+    for (Element component : text.getElements()) {
+      components.pushMap(serializeText(component));
     }
-    encodedText.putArray("components", lines);
+    encodedText.putArray("components", components);
 
-    encodedText.putString("value", line.getText());
-
-    WritableMap bounds = processBounds(line.getBoundingBox());
-
-    encodedText.putMap("bounds", bounds);
-
+    encodedText.putString("value", text.getText());
+    encodedText.putMap("bounds", serializeBounds(text.getBoundingBox()));
     encodedText.putString("type", "line");
+
     return encodedText;
   }
 
-  private WritableMap serializeElement(Text.Element element) {
+  private WritableMap serializeText(Element text) {
     WritableMap encodedText = Arguments.createMap();
 
-    encodedText.putString("value", element.getText());
+    WritableArray components = Arguments.createArray();
+    encodedText.putArray("components", components);
 
-    WritableMap bounds = processBounds(element.getBoundingBox());
-
-    encodedText.putMap("bounds", bounds);
-
+    encodedText.putString("value", text.getText());
+    encodedText.putMap("bounds", serializeBounds(text.getBoundingBox()));
     encodedText.putString("type", "element");
+
     return encodedText;
   }
 
-  private WritableMap processBounds(Rect frame) {
-    WritableMap origin = Arguments.createMap();
-    int x = frame.left;
-    int y = frame.top;
+  private WritableMap serializeBounds(Rect boundingBox) {
+    int x = boundingBox.left;
+    int y = boundingBox.top;
+    int width = boundingBox.width();
+    int height = boundingBox.height();
 
-    if (frame.left < mWidth / 2) {
+    if (x < mWidth / 2) {
       x = x + mPaddingLeft / 2;
-    } else if (frame.left > mWidth /2) {
+    } else if (x > mWidth / 2) {
       x = x - mPaddingLeft / 2;
     }
 
-    if (frame.top < mHeight / 2) {
+    if (height < mHeight / 2) {
       y = y + mPaddingTop / 2;
-    } else if (frame.top > mHeight / 2) {
+    } else if (height > mHeight / 2) {
       y = y - mPaddingTop / 2;
     }
 
-    origin.putDouble("x", x * mScaleX);
-    origin.putDouble("y", y * mScaleY);
+    WritableMap origin = Arguments.createMap();
+    origin.putDouble("x", x * this.mScaleX);
+    origin.putDouble("y", y * this.mScaleY);
 
     WritableMap size = Arguments.createMap();
-    size.putDouble("width", frame.width() * mScaleX);
-    size.putDouble("height", frame.height() * mScaleY);
+    size.putDouble("width", width * this.mScaleX);
+    size.putDouble("height", height * this.mScaleY);
 
     WritableMap bounds = Arguments.createMap();
     bounds.putMap("origin", origin);
     bounds.putMap("size", size);
+
     return bounds;
   }
 
@@ -215,11 +222,11 @@ public class TextRecognizerAsyncTask extends android.os.AsyncTask<Void, Void, Vo
     ReadableMap faceBounds = text.getMap("bounds");
 
     ReadableMap oldOrigin = faceBounds.getMap("origin");
-    WritableMap mirroredOrigin = positionMirroredHorizontally(
+    WritableMap mirroredOrigin = FaceDetectorUtils.positionMirroredHorizontally(
             oldOrigin, mImageDimensions.getWidth(), mScaleX);
 
     double translateX = -faceBounds.getMap("size").getDouble("width");
-    WritableMap translatedMirroredOrigin = positionTranslatedHorizontally(mirroredOrigin, translateX);
+    WritableMap translatedMirroredOrigin = FaceDetectorUtils.positionTranslatedHorizontally(mirroredOrigin, translateX);
 
     WritableMap newBounds = Arguments.createMap();
     newBounds.merge(faceBounds);
@@ -238,25 +245,5 @@ public class TextRecognizerAsyncTask extends android.os.AsyncTask<Void, Void, Vo
     text.putArray("components", newComponents);
 
     return text;
-  }
-
-  public static WritableMap positionTranslatedHorizontally(ReadableMap position, double translateX) {
-    WritableMap newPosition = Arguments.createMap();
-    newPosition.merge(position);
-    newPosition.putDouble("x", position.getDouble("x") + translateX);
-    return newPosition;
-  }
-
-  public static WritableMap positionMirroredHorizontally(ReadableMap position, int containerWidth, double scaleX) {
-    WritableMap newPosition = Arguments.createMap();
-    newPosition.merge(position);
-    newPosition.putDouble("x", valueMirroredHorizontally(position.getDouble("x"), containerWidth, scaleX));
-    return newPosition;
-  }
-
-  public static double valueMirroredHorizontally(double elementX, int containerWidth, double scaleX) {
-    double originalX = elementX / scaleX;
-    double mirroredX = containerWidth - originalX;
-    return mirroredX * scaleX;
   }
 }
